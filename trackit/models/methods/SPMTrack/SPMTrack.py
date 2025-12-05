@@ -33,6 +33,7 @@ class SPMTrack_DINOv2(nn.Module):
 
         self.expert_alpha = expert_alpha
         self.use_rsexpert = use_rsexpert
+        self.decay_memory = 0.5
 
         for name, param in self.named_parameters():
             if not ('.experts.' in name or '.gate' in name):
@@ -91,7 +92,7 @@ class SPMTrack_DINOv2(nn.Module):
         opt = (enc_opt.unsqueeze(-1) * att.unsqueeze(-2)).permute((0, 3, 1, 2)).contiguous().squeeze(1)
         output1 = self.head(opt)
 
-        query_2 = track_query + new_query + self.query_embed.unsqueeze(0)
+        query_2 = self.decay_memory * track_query + new_query + self.query_embed.unsqueeze(0)
         fusion_feat2 = torch.cat((query_2, z_feat, x_1), dim=1)
 
         for i in range(len(self.blocks)):

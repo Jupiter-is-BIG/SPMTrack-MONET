@@ -10,8 +10,10 @@ class TMoELayer(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, r: int, alpha: float, dropout: float,
                  rs_expert: bool = False, init_method: str = 'bert',
                  expert_nums: int = 4, blc_alpha: float = 0.0, blc_weight: float = 0.0,
-                 shared_expert: bool = False, route_compression: bool = False):
+                 shared_expert: bool = False, route_compression: bool = False,
+                 top_k: int | None = None):
         super().__init__()
+        self.top_k = top_k
         self.route_compression = route_compression
         if self.route_compression:
             self.compress_expert = nn.ParameterList([nn.Parameter(torch.empty(r, in_dim)) for _ in range(expert_nums)])
@@ -87,6 +89,70 @@ class TMoELayer(nn.Module):
                 results.append((compress_expert_out @ self.shared_expert.transpose(0, 1)) * self.scaling)
             for i in range(self.expert_num):
                 results.append(torch.unsqueeze(route_weight[:,:,i], -1) * (compress_expert_out @ self.routed_experts[i].transpose(0, 1)) * self.scaling)
+        return sum(results)
+    
+    def forward(self, x: torch.Tensor):
+        logits = self.expert_route(x)  # [B, T, E]
+
+        if self.top_k is None or self.top_k >= self.expert_num:
+            route_weight = logits.softmax(dim=-1)
+            use_topk = False
+        else:
+            topk_vals, topk_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [B, T, K]
+            topk_weight = topk_vals.softmax(dim=-1)                         # [B, T, K]
+            use_topk = True
+
+        if self.route_compression:
+            route_weight = logits.softmax(dim=-1) if not use_topk else _build_full_route(logits, topk_idx, topk_weight)
+            results = []
+            for i in range(self.expert_num):
+                compress_expert_out = self.dropout(x) @ self.compress_expert[i].transpose(0, 1)
+                expert_out = compress_expert_out @ self.routed_experts[i].transpose(0, 1)
+                gate = route_weight[:, :, i].unsqueeze(-1)
+                results.append(gate * expert_out * self.scaling)
+            return sum(results)
+
+        # ---- non-route_compression optimized top-k ----
+        compress_expert_out = self.dropout(x) @ self.compress_expert.transpose(0, 1)  # [B, T, r]
+
+        results = []
+
+        if self.enable_shared_expert:
+            shared_out = compress_expert_out @ self.shared_expert.transpose(0, 1)
+            results.append(shared_out * self.scaling)
+
+        if not use_topk:
+            route_weight = logits.softmax(dim=-1)
+            for i in range(self.expert_num):
+                expert_out = compress_expert_out @ self.routed_experts[i].transpose(0, 1)
+                gate = route_weight[:, :, i].unsqueeze(-1)
+                results.append(gate * expert_out * self.scaling)
+            return sum(results)
+
+        # --- top-k optimized path ---
+        B, T, K = topk_idx.shape
+        flat_idx = topk_idx.view(B * T, K)        # [BT, K]
+        flat_weight = topk_weight.view(B * T, K)  # [BT, K]
+        flat_ce = compress_expert_out.view(B * T, -1)  # [BT, r]
+
+        out = torch.zeros(B * T, self.routed_experts[0].shape[0], device=x.device, dtype=x.dtype)  # [BT, out_dim]
+
+        for k_i in range(K):
+            expert_ids = flat_idx[:, k_i]  # [BT]
+            w_k = flat_weight[:, k_i].unsqueeze(-1)  # [BT, 1]
+            expert_out_k = torch.zeros_like(out)
+            for e_id in range(self.expert_num):
+                mask = (expert_ids == e_id)
+                if not mask.any():
+                    continue
+                ce_sel = flat_ce[mask]  # [N_e, r]
+                routed = self.routed_experts[e_id]  # [out_dim, r]
+                expert_out_k[mask] = ce_sel @ routed.transpose(0, 1)  # [N_e, out_dim]
+
+            out += w_k * expert_out_k * self.scaling
+
+        out = out.view(B, T, -1)
+        results.append(out)
         return sum(results)
 
 
